@@ -1,0 +1,149 @@
+# 放在仓库里的位置： .github/workflows/espeak-android.yml
+#
+# 作用：从 eSpeak NG 官方源码，在 GitHub 的云端机器上编出安卓用的库和语言数据，
+# 并且自动检查三件事（结果写在这次运行的"Summary"页面里，也在产物的 BUILD-INFO.txt 里）：
+#   1. 库有没有把 eSpeak 的 C 接口（espeak_Initialize 等四个函数）暴露出来
+#   2. 库依赖哪些别的库（比如 libc++_shared.so），缺的会自动补上
+#   3. 64 位库是不是 16KB 页对齐（新版安卓需要）
+#
+# 做法参考了 LettuceAI 项目的做法：官方仓库的 android 目录用 Gradle 编，
+# Gradle 会按需下载匹配的 NDK 和 CMake；语言数据另用 CMake 在云端机器上本机编一份。
+
+name: Build eSpeak NG for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      espeak_ref:
+        description: "eSpeak NG 的分支、标签或提交号（先用 master）"
+        required: true
+        default: "master"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      REF: ${{ inputs.espeak_ref }}
+
+    steps:
+      - name: 取 eSpeak NG 源码
+        run: |
+          set -euo pipefail
+          git clone https://github.com/espeak-ng/espeak-ng.git src
+          cd src
+          git checkout "$REF"
+          echo "ESPEAK_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 本机编译一份，只为生成语言数据
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+          cmake --build build --target data -j"$(nproc)"
+
+      - name: 找到编好的语言数据
+        run: |
+          set -euo pipefail
+          PHONTAB=$(find src -name phontab -path '*espeak-ng-data*' | head -n1 || true)
+          if [ -z "$PHONTAB" ]; then
+            echo "没找到 phontab：语言数据没有编出来。下面是 build 目录的结构，请把它贴给我："
+            find src/build -maxdepth 3 -type d | head -80
+            exit 1
+          fi
+          echo "语言数据在：$(dirname "$PHONTAB")"
+          echo "DATA_DIR=$(dirname "$PHONTAB")" >> "$GITHUB_ENV"
+
+      - name: 编安卓库
+        working-directory: src/android
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleRelease || ./gradlew --no-daemon assembleRelease
+
+      - name: 取出各架构的库
+        run: |
+          set -euo pipefail
+          rm -rf tmp_apk out
+          mkdir -p tmp_apk out/jniLibs
+          mapfile -t APKS < <(find src/android -name '*.apk')
+          echo "找到的 APK：${APKS[*]:-无}"
+          for APK in "${APKS[@]}"; do
+            unzip -l "$APK" > apk_list.txt
+            if grep -q 'libttsespeak\.so' apk_list.txt; then
+              unzip -o -q "$APK" 'lib/*' -d tmp_apk || true
+            fi
+          done
+          COUNT=0
+          for ABI in arm64-v8a armeabi-v7a x86 x86_64; do
+            if [ -d "tmp_apk/lib/$ABI" ]; then
+              mkdir -p "out/jniLibs/$ABI"
+              cp tmp_apk/lib/"$ABI"/*.so "out/jniLibs/$ABI/"
+              COUNT=$((COUNT+1))
+            fi
+          done
+          if [ "$COUNT" -eq 0 ]; then
+            echo "APK 里没找到 libttsespeak.so，下面是 android 目录里能找到的 apk 和 so："
+            find src/android \( -name '*.apk' -o -name '*.so' \) | head -50
+            exit 1
+          fi
+
+      - name: 补齐依赖并检查
+        run: |
+          set -euo pipefail
+          NDK=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | sort | tail -n1 || true)
+          declare -A TRIPLE=( [arm64-v8a]=aarch64-linux-android [armeabi-v7a]=arm-linux-androideabi [x86]=i686-linux-android [x86_64]=x86_64-linux-android )
+          {
+            echo "eSpeak NG 提交：$ESPEAK_COMMIT"
+            echo "NDK：${NDK:-未找到}"
+            echo
+            for DIR in out/jniLibs/*/; do
+              ABI=$(basename "$DIR")
+              SO="${DIR}libttsespeak.so"
+              echo "=== $ABI ==="
+              if [ ! -f "$SO" ]; then echo "  没有 libttsespeak.so"; echo; continue; fi
+
+              readelf -d "$SO" > dyn.txt
+              if grep -q 'libc++_shared.so' dyn.txt && [ ! -f "${DIR}libc++_shared.so" ] && [ -n "${NDK:-}" ]; then
+                cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${TRIPLE[$ABI]}/libc++_shared.so" "$DIR" \
+                  && echo "已补上 libc++_shared.so"
+              fi
+
+              echo "依赖："
+              grep NEEDED dyn.txt | sed 's/^/  /' || true
+
+              nm -D --defined-only "$SO" > syms.txt
+              echo "C 接口导出："
+              for F in espeak_Initialize espeak_SetVoiceByName espeak_TextToPhonemes espeak_Terminate; do
+                if grep -qw "$F" syms.txt; then echo "  有 $F"; else echo "  缺 $F"; fi
+              done
+
+              echo "LOAD 段对齐（64 位库需要 0x4000 才支持 16KB 页）："
+              readelf -lW "$SO" | awk '$1=="LOAD" {print "  " $NF}' | sort -u
+              echo
+            done
+          } | tee out/BUILD-INFO.txt
+
+      - name: 整理产物
+        run: |
+          set -euo pipefail
+          mkdir -p out/espeak-ng-data
+          cp -r "$DATA_DIR"/. out/espeak-ng-data/
+          echo "语言数据大小：$(du -sh out/espeak-ng-data | cut -f1)" | tee -a out/BUILD-INFO.txt
+          echo "各架构库大小：" | tee -a out/BUILD-INFO.txt
+          du -sh out/jniLibs/* | tee -a out/BUILD-INFO.txt
+          { echo '```'; cat out/BUILD-INFO.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: espeak-android
+          path: out
+          retention-days: 30
