@@ -35,12 +35,22 @@ jobs:
           git checkout "$REF"
           echo "ESPEAK_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      # 云端机器上已经预装了安卓 SDK（ANDROID_HOME 已经设好）。
+      # 之前用的 android-actions/setup-android 会去装一个叫 tools 的老包，这个包现在已经不存在，
+      # 一装就报错退出，所以不用它，只做一件必须的事：接受 SDK 许可，
+      # 这样后面 Gradle 才能自动下载需要的 NDK 和 CMake。
+      - name: 接受安卓 SDK 许可
+        run: |
+          set -eo pipefail
+          SDKMANAGER=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n1)
+          echo "用 $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          echo "已处理许可"
 
       - name: 本机编译一份，只为生成语言数据
         working-directory: src
